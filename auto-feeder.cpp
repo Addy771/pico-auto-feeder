@@ -29,7 +29,10 @@ extern "C"
 #define L293_3A 21
 #define L293_4A 20
 
-#define STEPPER_DELAY_US 2500   // Time in microseconds to wait between motor steps. Lower time value = faster motor movement.
+// Time in microseconds to wait between motor steps. Lower time value = faster motor movement.
+// Motor starts at maximum delay (slowest movement)
+#define STEPPER_MIN_DELAY_US 1000   
+#define STEPPER_MAX_DELAY_US 2500
 #define MAX_ALARMS 12           // Maximum number of alarms that can be set concurrently
 
 Debounce debouncer;
@@ -38,6 +41,10 @@ stepper_t stepper;
 datetime_t current_time;
 datetime_t feed_alarms[MAX_ALARMS];
 uint8_t alarm_count = 0;
+
+int16_t stepper_pos;
+uint8_t stepper_speed;
+uint8_t stepper_acceleration;
 
 static inline void put_pixel(uint32_t pixel_grb) {
     pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
@@ -51,20 +58,66 @@ static inline uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 // Step the specified number of times, unless the end stops are triggered
-uint8_t step_limited(stepper_t *s, uint16_t target_steps, stepper_direction_t direction, uint32_t step_delay_us)
+uint8_t stepper_move(stepper_t *s, uint16_t target_steps, stepper_direction_t direction, uint8_t ignore_endstops)
 {
-    for (uint16_t step_cnt = 0; step_cnt < target_steps; step_cnt++)
-    {
-        // Return with error code if end stop is triggered
-        if (debouncer.read(LIMIT_SW_PIN) == 1)
-            return 1;
+    gpio_put(L293_EN_PIN, 1);   // Make sure motor driver is enabled
 
+    while (true)
+    {
+        // Return with error code if end stop is triggered and this behaviour is enabled
+        if (!ignore_endstops && debouncer.read(LIMIT_SW_PIN) == 1)
+            return 1;
+            
         stepper_step_once(s, direction);
-        sleep_us(step_delay_us);
+        target_steps--;
+
+        if (target_steps == 0)
+        {
+            stepper_release(s); // don't need to use power holding position
+            return 0;
+        }
+
+        sleep_us(STEPPER_MAX_DELAY_US);
+    }
+}
+
+// Attempt to find outermost home and park after
+uint8_t home_outer(void)
+{
+    stepper_acceleration = 1;
+    stepper_speed = 0;
+
+    // Attempts to move 300 steps, which is more than the full range of motion and should cause the end stop to trigger
+
+    if (stepper_move(&stepper, 300, backward, 0) == 0)
+    {
+        return 1;
     }
 
-    stepper_release(s); // don't need to use power holding position
-    return 0;
+    // Endstop was found. Move back to home position
+    stepper_speed = 0;
+    stepper_move(&stepper, 8, forward, 1);    
+    sleep_ms(50);   // wait long enough for limit switch state to update  
+
+    stepper_speed = 0;        
+    if (stepper_move(&stepper, 300, backward, 0) == 0)
+    {
+        return 1;
+    }
+    else
+    {
+        // Endstop was found. Move back to home position
+        stepper_speed = 0;
+        stepper_move(&stepper, 8, forward, 1);    
+
+        stepper_pos = 0;    // We're parked at home, so position is 0
+
+        stepper_release(&stepper);
+        gpio_put(L293_EN_PIN, 0);   // Disable motor driver
+
+        sleep_ms(50);   // wait long enough for limit switch state to update        
+        return 0;
+    }
 }
 
 
@@ -85,7 +138,6 @@ enum
     SLEEP,
     LOAD,
     DISPENSE,
-    HOME_OUTER,
     ERROR,
     TEST
 };
@@ -96,7 +148,8 @@ enum
     NONE,
     PWRON_FAIL,
     END_UNEXPECTED,
-    HOMING_FAIL
+    HOMING_FAIL,
+    JAMMED
 };
 
 int main() 
@@ -167,14 +220,13 @@ int main()
 
 
     uint8_t state = PWRON;
-    uint8_t next_state = PWRON;
     uint8_t entered = 1;
     uint8_t error = 0;
     uint8_t attempts, valid_checks;
-    uint16_t step_pos = 0;
 
     int8_t pb_state = debouncer.read(PB_PIN);
     int8_t lim_sw_state = debouncer.read(LIMIT_SW_PIN);
+
     while (1) {
 
         pb_state = debouncer.read(PB_PIN);
@@ -222,10 +274,19 @@ int main()
 
                 if (valid_checks >= 5)
                 {
-                    // Perform homing and go to sleep after
+                    // Home and go to sleep after
+                    if (home_outer() == 1)
+                    {
+                        // Homing failed, go to error state
+                        entered = 1;
+                        state = ERROR;
+                        error = HOMING_FAIL;
+                        break;        
+                    }                     
+
+
                     entered = 1;
-                    state = HOME_OUTER;
-                    next_state = SLEEP;
+                    state = SLEEP;
                 }                
                 break;
 
@@ -271,59 +332,6 @@ int main()
 
                     // Color red
                     put_pixel(urgb_u32(0x2f, 0, 0));                    
-                }
-
-                break;
-
-
-            // Attempt to move the slider outward to find where the home is and park the slider in the default position
-            case HOME_OUTER:
-                if (entered)
-                {
-                    entered = 0;
-
-                    gpio_put(L293_EN_PIN, 1);   // Enable motor driver
-
-                    // Color blue
-                    put_pixel(urgb_u32(0, 0, 0x0f));
-
-                    // Attempt to move 300 steps, which is more than the full range of motion and should cause the end stop to trigger
-                    if (step_limited(&stepper, 300, backward, STEPPER_DELAY_US) == 0)
-                    {
-                        // Homing failed, go to error state
-                        entered = 1;
-                        state = ERROR;
-                        error = HOMING_FAIL;
-                        break;
-                    }
-
-                    // Endstop was found. Move back a short distance and try homing again
-                    stepper.step_delay_us = STEPPER_DELAY_US;
-                    stepper_rotate_steps(&stepper, 8);
-
-                    sleep_ms(50);   // wait long enough for limit switch state to update
-                    if (step_limited(&stepper, 50, backward, STEPPER_DELAY_US) == 0)
-                    {
-                        // Homing failed, go to error state
-                        entered = 1;
-                        state = ERROR;
-                        error = HOMING_FAIL;
-                        break;                        
-                    }
-
-                    // Move back to home position
-                    stepper_rotate_steps(&stepper, 8);
-                    step_pos = 0;
-
-                    stepper_release(&stepper);
-                    gpio_put(L293_EN_PIN, 0);   // Disable motor driver
-
-                    sleep_ms(50);   // wait long enough for limit switch state to update
-
-                    // Enter whichever next state is specified
-                    entered = 1;
-                    state = next_state;
-                    
                 }
 
                 break;
@@ -381,8 +389,7 @@ int main()
                     {   
                         // Short press, perform homing and then dispense
                         entered = 1;
-                        state = HOME_OUTER;
-                        next_state = DISPENSE;
+                        state = DISPENSE;
                         break;
                     }
                 }
@@ -401,8 +408,7 @@ int main()
 
                         // Start feed cycle
                         entered = 1;
-                        state = HOME_OUTER;
-                        next_state = DISPENSE;
+                        state = DISPENSE;
                         break;                        
                     }
                 }
@@ -417,9 +423,19 @@ int main()
 
                     // color yellow
                     put_pixel(urgb_u32(0x1f, 0x1f, 0));
+                    
+                    // home
+                    if (home_outer() == 1)
+                    {
+                        // Homing failed, go to error state
+                        entered = 1;
+                        state = ERROR;
+                        error = HOMING_FAIL;
+                        break;        
+                    }  
 
                     // Move from home position to loading spot
-                    if (step_limited(&stepper, 102, forward, STEPPER_DELAY_US) != 0)
+                    if (stepper_move(&stepper, 102, forward, 0) != 0)
                     {
                         // Should not have hit an end stop here
                         entered = 1;
@@ -427,47 +443,54 @@ int main()
                         error = END_UNEXPECTED;    
                         break;                  
                     }
-                    step_pos = 102;
 
                     // do a little jiggle to help food fall in
-                    stepper.step_delay_us = STEPPER_DELAY_US;
                     for (uint8_t n = 0; n < 10; n++)
                     {
-                        stepper_rotate_steps(&stepper, 5);
+                        stepper_move(&stepper, 5, forward, 0);                        
                         sleep_ms(10);
-                        stepper_rotate_steps(&stepper, -5);
+                        stepper_move(&stepper, 5, backward, 0);                        
                         sleep_ms(10);
                     }
 
                     stepper_release(&stepper);  // Don't hold position
                     sleep_ms(1000);  // Wait for food to be loaded  
 
-                    // Move from loading spot halfway home
-                    // Move at half speed at first, this part is where highest motor torque is needed
-                    if (step_limited(&stepper, step_pos/2, backward, STEPPER_DELAY_US/2) != 0)
-                    {
-                        // Should not have hit an end stop here
-                        entered = 1;
-                        state = ERROR;      
-                        error = END_UNEXPECTED;     
-                        break;                 
-                    }      
 
-                    // // Normal speed the rest of the way to home                   
-                    // if (step_limited(&stepper, step_pos/2, backward, STEPPER_DELAY_US) != 0)
-                    // {
-                    //     // Should not have hit an end stop here
-                    //     entered = 1;
-                    //     state = ERROR;      
-                    //     error = END_UNEXPECTED;     
-                    //     break;                 
-                    // }           
-
+                    entered = 1;    // we will change states after
 
                     // Perform homing to complete feeding cycle and confirm slider is not stuck
+                    // Home and go to sleep after
+                    if (home_outer() == 1)
+                    {
+                        // Slider is jammed. Try to move it back to the inner endstop
+                        stepper_speed = 0;
+                        if (stepper_move(&stepper, 300, forward, 0) == 0)
+                        {
+                            // Homing failed, go to error state
+                            state = ERROR;
+                            error = HOMING_FAIL;
+                            break;  
+                        }                        
+
+                        // Back away from the endstop
+                        stepper_speed = 0;
+                        stepper_move(&stepper, 20, backward, 1);
+                        sleep_ms(50);   // wait long enough for limit switch state to update  
+
+                        // Try to home once more, to finish the feed cycle
+                        if(home_outer() == 1)
+                        {
+                            // Homing failed, go to error state
+                            state = ERROR;
+                            error = JAMMED;
+                            break;  
+                        }
+      
+                    }      
+
                     entered = 1;
-                    state = HOME_OUTER;
-                    next_state = SLEEP;         
+                    state = SLEEP;         
 
                 }       
                 break;         
