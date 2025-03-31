@@ -33,7 +33,10 @@ extern "C"
 // Motor starts at maximum delay (slowest movement)
 #define STEPPER_MIN_DELAY_US 1000   
 #define STEPPER_MAX_DELAY_US 2500
-#define MAX_ALARMS 12           // Maximum number of alarms that can be set concurrently
+#define SPEED_LEVELS 32             // How finely speed is incremented between minimum and maximum
+#define MAX_ALARMS 12               // Maximum number of alarms that can be set concurrently
+
+#define SPEED_INC ((STEPPER_MAX_DELAY_US - STEPPER_MIN_DELAY_US) / SPEED_LEVELS)
 
 Debounce debouncer;
 stepper_t stepper;
@@ -43,8 +46,9 @@ datetime_t feed_alarms[MAX_ALARMS];
 uint8_t alarm_count = 0;
 
 int16_t stepper_pos;
-uint8_t stepper_speed;
-uint8_t stepper_acceleration;
+int8_t stepper_speed;
+int8_t stepper_acceleration;
+uint16_t step_delay = STEPPER_MAX_DELAY_US;
 
 static inline void put_pixel(uint32_t pixel_grb) {
     pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
@@ -55,6 +59,28 @@ static inline uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
             ((uint32_t) (r) << 8) |
             ((uint32_t) (g) << 16) |
             (uint32_t) (b);
+}
+
+// Apply acceleration and speed limit to the current speed value
+void update_speed(void)
+{
+    // If speed will be increased
+    if (stepper_acceleration >= 0)
+    {
+        // Make sure speed doesn't exceed limit
+        if (stepper_speed < SPEED_LEVELS-1)
+            stepper_speed += stepper_acceleration;
+    }
+    else
+    // Negative acceleration, slowing down
+    {
+        stepper_speed += stepper_acceleration;
+
+        if (stepper_speed < 0)
+            stepper_speed = 0;
+    }
+
+    step_delay = STEPPER_MAX_DELAY_US - (stepper_speed * SPEED_INC);
 }
 
 // Step the specified number of times, unless the end stops are triggered
@@ -73,11 +99,18 @@ uint8_t stepper_move(stepper_t *s, uint16_t target_steps, stepper_direction_t di
 
         if (target_steps == 0)
         {
-            stepper_release(s); // don't need to use power holding position
+            // Delay to hold position temporarily
+            sleep_us(STEPPER_MAX_DELAY_US);
+            stepper_release(s); 
             return 0;
         }
 
-        sleep_us(STEPPER_MAX_DELAY_US);
+        // If we are near the end of travel and the speed is over half, start decelerating
+        if (target_steps < SPEED_LEVELS/2 && stepper_speed >= SPEED_LEVELS/2)
+            stepper_acceleration = -8;
+
+        update_speed();
+        sleep_us(step_delay);
     }
 }
 
@@ -435,6 +468,8 @@ int main()
                     }  
 
                     // Move from home position to loading spot
+                    stepper_speed = 0;
+                    stepper_acceleration = 1;
                     if (stepper_move(&stepper, 102, forward, 0) != 0)
                     {
                         // Should not have hit an end stop here
@@ -445,13 +480,18 @@ int main()
                     }
 
                     // do a little jiggle to help food fall in
-                    for (uint8_t n = 0; n < 10; n++)
-                    {
-                        stepper_move(&stepper, 5, forward, 0);                        
-                        sleep_ms(10);
-                        stepper_move(&stepper, 5, backward, 0);                        
-                        sleep_ms(10);
-                    }
+                    // *** this jiggle produces the most noise. It may not be necessary
+                    // stepper_acceleration = 4;                    
+                    // for (uint8_t n = 0; n < 10; n++)
+                    // {
+                    //     stepper_speed = 0;
+                    //     stepper_move(&stepper, 5, forward, 0);                        
+                    //     sleep_ms(10);
+
+                    //     stepper_speed = 0;
+                    //     stepper_move(&stepper, 5, backward, 0);                        
+                    //     sleep_ms(10);
+                    // }
 
                     stepper_release(&stepper);  // Don't hold position
                     sleep_ms(1000);  // Wait for food to be loaded  
@@ -465,6 +505,7 @@ int main()
                     {
                         // Slider is jammed. Try to move it back to the inner endstop
                         stepper_speed = 0;
+                        stepper_acceleration = 1;
                         if (stepper_move(&stepper, 300, forward, 0) == 0)
                         {
                             // Homing failed, go to error state
