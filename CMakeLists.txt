@@ -60,6 +60,8 @@ set_source_files_properties(stepper.c PROPERTIES LANGUAGE CXX)
 
 set_target_properties(${TARGET_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
+target_link_options(${TARGET_NAME} PRIVATE -Xlinker --print-memory-usage)
+
 # pull in common dependencies
 target_link_libraries(${TARGET_NAME} 
 	pico_stdlib 
